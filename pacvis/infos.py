@@ -1,54 +1,130 @@
 from itertools import groupby
 import math
 import re
+import collections
+import sqlite3
+import operator
 
-import pyalpm
-import pycman
+from distutils.version import LooseVersion
 
 from .console import start_message, append_message, print_message
 
+SQL_GET_ALL_PKGS = """
+SELECT
+  name,
+  (category || '-' || section) AS section,
+  CASE
+    WHEN release IS NULL THEN version
+    ELSE (version || '-' || release)
+  END AS version,
+  base.groups,
+  dep.provides,
+  dep.depends,
+  dep.optdepends,
+  description AS desc
+FROM packages
+LEFT JOIN (
+    SELECT
+      package,
+      group_concat(
+        CASE WHEN relationship = 'PKGREP' AND version = ''
+        THEN dependency END
+      ) provides,
+      group_concat(CASE WHEN relationship = 'PKGDEP' THEN dependency END) depends,
+      group_concat(CASE WHEN relationship = 'PKGRECOM' THEN dependency END) optdepends
+    FROM package_dependencies
+    GROUP BY package
+  ) dep
+  ON dep.package = packages.name
+LEFT JOIN (
+    SELECT
+      pkgdep.dependency package,
+      group_concat(pkgdep.package) groups
+    FROM package_dependencies pkgdep
+    LEFT JOIN packages ON pkgdep.package = packages.name
+    WHERE packages.section = 'bases' AND pkgdep.relationship = 'PKGDEP'
+    GROUP BY dependency
+  ) base
+  ON base.package = packages.name
+WHERE packages.section != 'bases'
+"""
+
+RE_dep = re.compile(r'^([a-z0-9][a-z0-9+.-]*)(.*)$')
+RE_comp = re.compile(r'([<>]=|<<|>>|[<=>])')
+DEP_OPERATORS = {
+    '<<': operator.lt,
+    '<': operator.le,
+    '<=': operator.le,
+    '=': operator.eq,
+    '>=': operator.ge,
+    '>': operator.ge,
+    '>>': operator.gt
+}
+
+Package = collections.namedtuple('Package', (
+    'name', 'section', 'version', 'groups',
+    'provides', 'depends', 'optdepends', 'desc'
+))
+
+class AbbsDB:
+    def __init__(self, db):
+        self.name = db
+        self.packages = []
+        self.package_dict = {}
+        self.load()
+
+    def load(self):
+        conn = sqlite3.connect(self.name)
+        cur = conn.cursor()
+        for row in cur.execute(SQL_GET_ALL_PKGS):
+            name, section, version, groups, provides, depends, optdepends, desc = row
+            pkg = Package(
+                name, section, version,
+                groups.split(',') if groups else [],
+                provides.split(',') if provides else [],
+                depends.split(',') if depends else [],
+                optdepends.split(',') if optdepends else [],
+                desc
+            )
+            self.packages.append(pkg)
+            self.package_dict[name] = pkg
+        conn.close()
+
+    def find_satisfier(self, dep):
+        deppkgname, depcomp = RE_dep.match(dep).groups()
+        if depcomp:
+            depverop = RE_comp.match(s).group(0)
+            depver = depcomp[len(depverop):]
+        deppkg = self.package_dict.get(deppkgname)
+        if deppkg and (not depcomp or DEP_OPERATORS[depverop](
+            LooseVersion(deppkg.version), LooseVersion(depver))):
+            return deppkg
+        for pkg in self.packages:
+            if deppkgname in pkg.provides and not depcomp:
+                return pkg
 
 class DbInfo:
-    def __init__(self):
-        self.handle = pycman.config.init_with_config("/etc/pacman.conf")
-        self.localdb = self.handle.get_localdb()
-        self.syncdbs = self.handle.get_syncdbs()
-        self.packages = self.localdb.pkgcache
+    def __init__(self, db='abbs.db'):
+        self.localdb = AbbsDB(db)
+        self.packages = self.localdb.packages
         self.all_pkgs = {}
         self.groups = {}
-        self.repos = {}
         self.vdeps = {}
-        self.repo_list = [x.name for x in self.syncdbs]
-        local = self.localdb.name
-        self.repo_list.append(local)
-        self.repos[local] = RepoInfo(local, self)
-        print_message("Enabled repos: %s" %
-                      ", ".join(db.name for db in self.syncdbs))
-        print_message("Repo_list repos: %s" % ", ".join(self.repo_list))
+        self.repo = RepoInfo(db, self)
+        print_message("Loading %s" % db)
 
     def find_syncdb(self, pkgname):
-        repo = ""
-        found = False
-        for db in self.syncdbs:
-            if db.get_pkg(pkgname) is not None:
-                found = True
-                repo = db.name
-                break
-        if not found:
-            repo = self.localdb.name
-        if repo not in self.repos:
-            self.repos[repo] = RepoInfo(repo, self)
-        self.repos[repo].add_pkg(pkgname)
+        repo = self.localdb.name
+        self.repo.add_pkg(pkgname)
         return repo
 
     def get(self, pkgname):
         return self.all_pkgs[pkgname]
 
     def resolve_dependency(self, dep):
-        pkgname = self.requirement2pkgname(dep)
         if dep in self.all_pkgs:
             return dep
-        pkg = pyalpm.find_satisfier(self.packages, dep)
+        pkg = self.localdb.find_satisfier(dep)
         if pkg is None:
             return None
         return pkg.name
@@ -67,8 +143,7 @@ class DbInfo:
                     for dep in pkg.deps:
                         while pkg.name in self.get(dep).requiredby:
                             self.get(dep).requiredby.remove(pkg.name)
-                    while pkg.repo in self.repos and pkg.name in self.repos[pkg.repo].pkgs:
-                        self.repos[pkg.repo].pkgs.remove(pkg.name)
+                    self.repo.pkgs.remove(pkg.name)
                     del self.all_pkgs[pkg.name]
                     del self.vdeps[pkg.name]
         return self.all_pkgs
@@ -167,88 +242,36 @@ class DbInfo:
         append_message("max available level: %d" % nextlevel)
         return nextlevel
 
-    def calc_repo_average(self):
-        result = {}
-        for repo in self.repos:
-            result[repo] = self.repos[repo].average_level()
-        return result
-
-    def topology_sort(self, usemagic, aligntop, mergerepos):
-        if mergerepos:
-            all_pkgs = {x for x in self.all_pkgs}
+    def topology_sort(self, usemagic, aligntop, mergerepos=True):
+        all_pkgs = {x for x in self.all_pkgs}
+        self.top_down_sort(usemagic, all_pkgs)
+        self.buttom_up_sort(all_pkgs)
+        if aligntop:
+            # do top_down_sort again to align to top
             self.top_down_sort(usemagic, all_pkgs)
-            self.buttom_up_sort(all_pkgs)
-            if aligntop:
-                # do top_down_sort again to align to top
-                self.top_down_sort(usemagic, all_pkgs)
-            self.minimize_levels(all_pkgs, 1)
-        else:
-            nextlevel = 1
-            for repo in self.repo_list:
-                if repo not in self.repos:
-                    continue
-                print_message("Repo %s" % repo)
-                all_pkgs = self.repos[repo].pkgs
-                for pkg in all_pkgs:
-                    self.get(pkg).level = nextlevel  # assign initial level
-                self.top_down_sort(usemagic, all_pkgs)
-                self.buttom_up_sort(all_pkgs)
-                if aligntop:
-                    # do top_down_sort again to align to top
-                    self.top_down_sort(usemagic, all_pkgs)
-                nextlevel = self.minimize_levels(all_pkgs, nextlevel)
+        self.minimize_levels(all_pkgs, 1)
 
     def calcCSize(self, pkg):
-        removing_pkg = set()
-
-        def remove_pkg(pkgname):
-            nonlocal removing_pkg
-            removing_pkg.add(pkgname)
-            for dep in self.get(pkgname).requiredby:
-                if dep not in removing_pkg:
-                    remove_pkg(dep)
-
-        remove_pkg(pkg.name)
-        pkg.csize = sum(self.get(pkg).isize for pkg in removing_pkg)
-        append_message("csize %s: %d" % (pkg.name, pkg.csize))
+        # really don't know
+        pkg.csize = 1
         return pkg.csize
 
     def calcCsSize(self, pkg):
-        removing_pkg = set()
-        analyzing_pkg = set()
-
-        def remove_pkg(pkgname):
-            nonlocal removing_pkg
-            removing_pkg.add(pkgname)
-            for dep in self.get(pkgname).deps:
-                if not self.get(dep).explicit:
-                    analyzing_pkg.add(dep)
-            for dep in self.get(pkgname).requiredby:
-                if dep not in removing_pkg:
-                    remove_pkg(dep)
-
-        remove_pkg(pkg.name)
-        while len(analyzing_pkg) > 0:
-            apkg = self.get(analyzing_pkg.pop())
-            if apkg.name in removing_pkg:
-                continue
-            if all(dep in removing_pkg for dep in apkg.requiredby):
-                remove_pkg(apkg.name)
-        pkg.cssize = sum(self.get(pkg).isize for pkg in removing_pkg)
-        append_message("cssize %s: %d" % (pkg.name, pkg.cssize))
+        # really don't know either
+        pkg.cssize = 1
         return pkg.cssize
 
     def calcSizes(self):
-        start_message("Calculating csize ... ")
+        # start_message("Calculating csize ... ")
         maxCSize = max(self.calcCSize(pkg) for pkg in self.all_pkgs.values())
-        append_message(" max cSize: " + str(maxCSize))
-        start_message("Calculating cssize ... ")
+        # append_message(" max cSize: " + str(maxCSize))
+        # start_message("Calculating cssize ... ")
         maxCsSize = max(self.calcCsSize(pkg) for pkg in self.all_pkgs.values())
-        append_message(" max csSize: " + str(maxCsSize))
+        # append_message(" max csSize: " + str(maxCsSize))
 
     def requirement2pkgname(self, requirement):
         if any(x in requirement for x in "<=>"):
-            return re.split("[<=>]", requirement)[0]
+            return RE_comp.split(requirement)[0]
         return requirement
 
     def find_vdep(self, provide, pkg):
@@ -265,18 +288,19 @@ class DbInfo:
 class PkgInfo:
     def __init__(self, name, dbinfo):
         self.name = name
-        self.pkg = dbinfo.localdb.get_pkg(name)
+        self.pkg = dbinfo.localdb.package_dict[name]
         dbinfo.all_pkgs[name] = self
         self.deps = []
         self.requiredby = []
         self.optdeps = []
         self.level = 1
         self.circledeps = []
-        self.explicit = self.pkg.reason == 0
-        self.isize = self.pkg.isize
+        self.explicit = 0  # REMOVE
+        self.isize = 1 # unknown
         self.desc = self.pkg.desc
         self.version = self.pkg.version
         self.repo = dbinfo.find_syncdb(self.name)
+        self.section = self.pkg.section
         self.groups = self.pkg.groups
         self.provides = [dbinfo.find_vdep(pro, self.name)
                          for pro in self.pkg.provides]
@@ -294,8 +318,7 @@ class PkgInfo:
                 self.deps.append(dependency)
                 dbinfo.get(dependency).requiredby.append(self.name)
         for dep in self.pkg.optdepends:
-            depname = dep.split(":")[0]
-            resolved = dbinfo.resolve_dependency(depname)
+            resolved = dbinfo.resolve_dependency(dep)
             if resolved is not None:
                 self.optdeps.append(resolved)
         # self.requiredby.extend(self.pkg.compute_requiredby())
@@ -325,12 +348,9 @@ class GroupInfo (PkgInfo):
         self.dbinfo.get(pkgname).requiredby.append(self.name)
 
     def reset_repo(self):
-        for repo in self.dbinfo.repo_list:
-            for pkg in self.deps:
-                if self.dbinfo.get(pkg).repo == repo:
-                    self.repo = repo
-                    self.dbinfo.repos[self.repo].pkgs.add(self.name)
-                    return
+        for pkg in self.deps:
+            self.dbinfo.repo.pkgs.add(self.name)
+            return
 
     def find_dependencies(self, dbinfo):
         self.reset_repo()
@@ -356,12 +376,9 @@ class VDepInfo (PkgInfo):
         self.dbinfo.vdeps[name] = self
 
     def reset_repo(self):
-        for repo in self.dbinfo.repo_list:
-            for pkg in self.deps:
-                if self.dbinfo.get(pkg).repo == repo:
-                    self.repo = repo
-                    self.dbinfo.repos[self.repo].pkgs.add(self.name)
-                    return
+        for pkg in self.deps:
+            self.dbinfo.repo.pkgs.add(self.name)
+            return
 
     def find_dependencies(self, dbinfo):
         self.reset_repo()
@@ -379,19 +396,3 @@ class RepoInfo:
     def add_pkg(self, pkgname):
         self.pkgs.add(pkgname)
 
-
-def test_circle_detection():
-    dbinfo = DbInfo()
-    start_message("find all packages...")
-    dbinfo.find_all()
-    append_message("done")
-    start_message("find all dependency circles...")
-    dbinfo.find_circles()
-    append_message("done")
-    for name, pkg in dbinfo.all_pkgs.items():
-        if len(pkg.circledeps) > 1:
-            print_message("%s(%s): %s" %
-                          (pkg.name, pkg.circledeps, ", ".join(pkg.deps)))
-    dbinfo.topology_sort()
-    for pkg in sorted(dbinfo.all_pkgs.values(), key=lambda x: x.level):
-        print("%s(%d): %s" % (pkg.name, pkg.level, ", ".join(pkg.deps)))

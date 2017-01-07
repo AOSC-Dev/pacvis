@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import os
 import json
 from types import SimpleNamespace
 
@@ -7,7 +8,7 @@ import tornado.ioloop
 import tornado.web
 
 from .console import start_message, append_message, print_message
-from .infos import DbInfo, PkgInfo, GroupInfo, VDepInfo
+from .infos import DbInfo, GroupInfo, VDepInfo
 
 
 # Tornado entry
@@ -46,6 +47,10 @@ class MainHandler(tornado.web.RequestHandler):
         append_message("done")
         start_message("Finding all dependency circles ... ")
         dbinfo.find_circles()
+        #for name, pkg in dbinfo.all_pkgs.items():
+                #if len(pkg.circledeps) > 1:
+                    #print_message("%s(%s): %s" %
+                                  #(pkg.name, pkg.circledeps, ", ".join(pkg.deps)))
         append_message("done")
         dbinfo.topology_sort(args.usemagic, args.aligntop, args.mergerepos)
         dbinfo.calcSizes()
@@ -103,7 +108,7 @@ class MainHandler(tornado.web.RequestHandler):
                               "provides": ", ".join(pkg.provides),
                               "desc": pkg.desc,
                               "version": pkg.version,
-                              "repo": pkg.repo,
+                              "repo": pkg.section,
                               })
         ids = 0
         for pkg in sorted(dbinfo.all_pkgs.values(), key=lambda x: x.level):
@@ -145,11 +150,15 @@ class MainHandler(tornado.web.RequestHandler):
 
 
 def make_app():
-    import os
     return tornado.web.Application([
         (r"/", MainHandler),
         ], debug=True,
         static_path=os.path.join(os.path.dirname(__file__), "static"))
+
+
+def make_wsgi():
+    import tornado.wsgi
+    return tornado.wsgi.WSGIAdapter(make_app())
 
 
 def main():
